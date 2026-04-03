@@ -3,9 +3,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -150,7 +151,9 @@ def build_diff_excerpt(
     second_pass_focus_files: int,
     second_pass_hunks_per_file: int,
     second_pass_chars_per_file: int,
-) -> Tuple[str, str]:
+) -> Tuple[str, str, Dict[str, str]]:
+    """返回 (diff摘要文本, 覆盖说明, {filename: 压缩后diff})。
+    第三个返回值保证与摘要文本使用完全相同的截断数据，供行号速查表使用。"""
     files_sorted = sorted(files, key=_file_priority, reverse=True)
     with_diff: List[Tuple[str, Dict[str, Any], str]] = []
     for file_item in files_sorted:
@@ -168,6 +171,7 @@ def build_diff_excerpt(
     used = 0
     included_files: List[str] = []
     focused_included: List[str] = []
+    compacted_diffs: Dict[str, str] = {}  # filename -> 压缩后 diff（与摘要一致）
 
     for idx, (filename, _file_item, diff) in enumerate(primary_items):
         is_focus = idx in focus_indices
@@ -186,17 +190,20 @@ def build_diff_excerpt(
                 truncated_body = _safe_truncate(body, remain - len(header))
                 chunks.append(header + truncated_body + "\n... [TRUNCATED]\n")
                 included_files.append(str(filename))
+                # 记录实际写入摘要的截断版本
+                compacted_diffs[str(filename)] = _safe_truncate(compact_diff, remain - len(header) - 10)
                 if is_focus:
                     focused_included.append(str(filename))
             break
         chunks.append(header + body)
         used += add_len
         included_files.append(str(filename))
+        compacted_diffs[str(filename)] = compact_diff
         if is_focus:
             focused_included.append(str(filename))
 
     if not chunks:
-        return "（该 PR 未返回可用 diff，可能是二进制文件或平台限制）", "（未展开文件摘要不可用）"
+        return "（该 PR 未返回可用 diff，可能是二进制文件或平台限制）", "（未展开文件摘要不可用）", {}
 
     candidates = len(with_diff)
     omitted = max(candidates - len(included_files), 0)
@@ -207,7 +214,7 @@ def build_diff_excerpt(
         f"最终在预算内展开 {len(included_files)} 个文件，未展开 {omitted} 个。"
         f"二轮重点文件：{focus_names}"
     )
-    return "".join(chunks), omitted_summary
+    return "".join(chunks), omitted_summary, compacted_diffs
 
 
 def build_changed_file_list(files: List[Dict[str, Any]], limit: int = 120) -> str:
@@ -302,27 +309,19 @@ def _extract_added_code_blocks(
 
 
 def build_diff_line_reference(
-    files: List[Dict[str, Any]],
-    max_files: int = 12,
-    max_lines_per_file: int = 1200,
+    compacted_diffs: Dict[str, str],
+    max_lines_per_file: int = 300,
 ) -> str:
-    """为每个变更文件生成精确的新文件行号速查表。
+    """根据 build_diff_excerpt 已压缩的 diff 生成行号速查表。
 
+    使用与摘要完全相同的数据，保证速查表中的行号与 diff 摘要一致。
     每行格式：
       L<新行号> [+] <内容前80字符>
       [DEL→L<N>] [-] <被删除行内容前80字符>
-    仅保留 hunk 头与真实改动行（+/-），不输出上下文行，降低截断风险。
-    速查表供 AI 审查时精确定位行号，避免估算偏差。
     """
-    sorted_files = sorted(files, key=_file_priority, reverse=True)[:max_files]
     sections: List[str] = []
 
-    for file_item in sorted_files:
-        filename = str(
-            file_item.get("filename") or file_item.get("patch", {}).get("new_path") or "unknown"
-        )
-        patch = file_item.get("patch", {})
-        diff = patch.get("diff", "") if isinstance(patch, dict) else ""
+    for filename, diff in compacted_diffs.items():
         if not diff:
             continue
 
@@ -352,11 +351,9 @@ def build_diff_line_reference(
                 new_line_no += 1
                 line_count += 1
             elif raw.startswith(" "):
-                # 速查表仅保留真实改动行，避免上下文过多导致后续改动被截断
                 new_line_no += 1
             elif raw.startswith("-"):
                 content = raw[1:81]
-                # 被删行无新行号，标注 DEL，并注明其紧邻的下一新行号供定位参考
                 file_lines.append(f"  [DEL→L{new_line_no:>4}] [-] {content}")
                 line_count += 1
 
@@ -473,17 +470,21 @@ def filter_incremental_files(
     return changed, f"增量复审模式：仅复审变更文件 {len(changed)} 个（未变更文件 {unchanged} 个）"
 
 
-def run_git_command(args: List[str], cwd: Optional[Path] = None) -> Tuple[int, str]:
-    proc = subprocess.run(
-        ["git"] + args,
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    return proc.returncode, proc.stdout.strip()
+def run_git_command(args: List[str], cwd: Optional[Path] = None, timeout: int = 120) -> Tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            ["git"] + args,
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return 1, f"git 操作超时（>{timeout}s）：git {' '.join(args[:2])}"
 
 
 def sync_local_repo(owner: str, repo: str, target_branch: str = "master") -> Tuple[str, str]:
@@ -506,11 +507,11 @@ def sync_local_repo(owner: str, repo: str, target_branch: str = "master") -> Tup
 
     local_repo_path.parent.mkdir(parents=True, exist_ok=True)
     if not local_repo_path.exists():
-        code, output = run_git_command(git_auth_args + ["clone", remote_base, str(local_repo_path)])
+        code, output = run_git_command(git_auth_args + ["clone", remote_base, str(local_repo_path)], timeout=300)
         if code != 0:
             return (f"失败：clone 异常 -> {output}", str(local_repo_path.resolve()))
 
-    code, output = run_git_command(git_auth_args + ["fetch", "--all", "--prune"], cwd=local_repo_path)
+    code, output = run_git_command(git_auth_args + ["fetch", "--all", "--prune"], cwd=local_repo_path, timeout=180)
     if code != 0:
         return (f"失败：fetch 异常 -> {output}", str(local_repo_path.resolve()))
 
@@ -519,19 +520,19 @@ def sync_local_repo(owner: str, repo: str, target_branch: str = "master") -> Tup
     if branch.startswith("-"):
         return (f"失败：分支名非法: {branch}", str(local_repo_path.resolve()))
 
-    code, output = run_git_command(["checkout", "--", "."], cwd=local_repo_path)  # 清理工作区
-    code, output = run_git_command(["checkout", branch], cwd=local_repo_path)
+    code, output = run_git_command(["checkout", "--", "."], cwd=local_repo_path, timeout=30)  # 清理工作区
+    code, output = run_git_command(["checkout", branch], cwd=local_repo_path, timeout=30)
     if code != 0:
         # 尝试 main 作为 fallback
         alt = "main" if branch == "master" else "master"
-        code2, output2 = run_git_command(["checkout", alt], cwd=local_repo_path)
+        code2, output2 = run_git_command(["checkout", alt], cwd=local_repo_path, timeout=30)
         if code2 == 0:
             branch = alt
             output = output2
         else:
             return (f"失败：checkout {branch} 异常 -> {output}", str(local_repo_path.resolve()))
 
-    code, output = run_git_command(["reset", "--hard", f"origin/{branch}"], cwd=local_repo_path)
+    code, output = run_git_command(["reset", "--hard", f"origin/{branch}"], cwd=local_repo_path, timeout=30)
     if code != 0:
         return (f"失败：reset --hard origin/{branch} 异常 -> {output}", str(local_repo_path.resolve()))
 
@@ -676,6 +677,34 @@ diff 行号速查表（行号为新文件行号，审查时严格从此表取行
 """
 
 
+def cleanup_old_cache(cache_dir: Path, max_age_days: int) -> int:
+    """删除超过 max_age_days 天未修改的缓存文件，返回删除数量。"""
+    if max_age_days <= 0 or not cache_dir.exists():
+        return 0
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    removed = 0
+    for f in cache_dir.glob("*.json"):
+        if datetime.fromtimestamp(f.stat().st_mtime) < cutoff:
+            f.unlink()
+            removed += 1
+    return removed
+
+
+def cleanup_old_repos(repo_root: Path, max_age_days: int) -> int:
+    """删除超过 max_age_days 天未使用（按 FETCH_HEAD mtime 判断）的本地克隆，返回删除数量。"""
+    if max_age_days <= 0 or not repo_root.exists():
+        return 0
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    removed = 0
+    # 结构为 repo_root/owner/repo/.git/FETCH_HEAD
+    for fetch_head in repo_root.glob("*/*/.git/FETCH_HEAD"):
+        if datetime.fromtimestamp(fetch_head.stat().st_mtime) < cutoff:
+            repo_path = fetch_head.parent.parent
+            shutil.rmtree(repo_path, ignore_errors=True)
+            removed += 1
+    return removed
+
+
 def save_markdown(owner: str, repo: str, number: int, content: str, prefix: str) -> Path:
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -724,6 +753,17 @@ def main() -> int:
         )
         incremental_review = os.getenv("INCREMENTAL_REVIEW", "true").lower() in ("1", "true", "yes", "on")
         cache_dir = Path(os.getenv("CACHE_DIR", ".review_cache"))
+        cache_max_age_days = int(os.getenv("CACHE_MAX_AGE_DAYS", "90"))
+        repo_root = Path(os.getenv("LOCAL_REPO_ROOT", "repos"))
+        repo_max_age_days = int(os.getenv("REPO_MAX_AGE_DAYS", "0"))  # 0=不自动删除
+
+        # 自动清理过期缓存和本地克隆
+        removed_cache = cleanup_old_cache(cache_dir, cache_max_age_days)
+        if removed_cache:
+            print(f"[CLEANUP] 已清理 {removed_cache} 个过期缓存文件（>{cache_max_age_days}天）")
+        removed_repos = cleanup_old_repos(repo_root, repo_max_age_days)
+        if removed_repos:
+            print(f"[CLEANUP] 已清理 {removed_repos} 个过期本地克隆（>{repo_max_age_days}天）")
 
         owner, repo, number = parse_pr_input(args.pr)
         if not owner or not repo:
@@ -760,7 +800,7 @@ def main() -> int:
             return 0
 
         target_files = files_for_review if files_for_review else files
-        diff_excerpt, diff_coverage_text = build_diff_excerpt(
+        diff_excerpt, diff_coverage_text, compacted_diffs = build_diff_excerpt(
             target_files,
             max_patch_chars=max_patch_chars,
             max_files_in_diff=max_files_in_diff,
@@ -779,9 +819,8 @@ def main() -> int:
             max_candidates_in_prompt=max_candidates_in_prompt,
         )
         diff_line_reference_text = build_diff_line_reference(
-            target_files,
-            max_files=int(os.getenv("DIFF_LINE_REF_MAX_FILES", "10")),       # 行号速查表最多展开文件数
-            max_lines_per_file=int(os.getenv("DIFF_LINE_REF_MAX_LINES", "300")),  # 每文件最多行数
+            compacted_diffs,
+            max_lines_per_file=int(os.getenv("DIFF_LINE_REF_MAX_LINES", "300")),
         )
 
         if not enable_line_candidates:

@@ -58,16 +58,16 @@ Cursor 会自动执行脚本并直接输出审查意见，无需手动操作。
 
 ```bash
 # Windows
-py review_draft_cursor.py --pr "https://gitcode.com/Ascend/msserviceprofiler/pulls/123"
+py review_draft.py --pr "https://gitcode.com/Ascend/msserviceprofiler/pulls/123"
 
 # macOS / Linux
-python3 review_draft_cursor.py --pr "https://gitcode.com/Ascend/msserviceprofiler/pulls/123"
+python3 review_draft.py --pr "https://gitcode.com/Ascend/msserviceprofiler/pulls/123"
 ```
 
 #### 方式 B：给 PR 编号
 
 ```bash
-python3 review_draft_cursor.py --pr 123 --owner Ascend --repo msserviceprofiler
+python3 review_draft.py --pr 123 --owner Ascend --repo msserviceprofiler
 ```
 
 运行后在 `output/` 目录生成：
@@ -85,7 +85,7 @@ review_task_Ascend_msserviceprofiler_pr123_YYYYMMDD_HHMMSS.md
 不依赖 AI 工具，直接调用 OpenAI 兼容接口输出审查结论（需在 `.env` 中配置 `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL`）：
 
 ```bash
-python3 review_draft_cursor.py --pr 123 --owner Ascend --repo msserviceprofiler --backend api
+python3 review_draft.py --pr 123 --owner Ascend --repo msserviceprofiler --backend api
 ```
 
 输出文件为 `review_Ascend_msserviceprofiler_pr123_YYYYMMDD_HHMMSS.md`。

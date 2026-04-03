@@ -1,11 +1,17 @@
 请对以下 GitCode PR 进行代码检视：$ARGUMENTS
 
+如果 $ARGUMENTS 为空，直接回复：
+> 用法：`/review <PR链接或PR编号>`
+> 示例：`/review https://gitcode.com/Owner/repo/pulls/123`
+> 或：`/review 123 --owner Owner --repo myrepo`
+并停止后续步骤。
+
 ## 执行步骤
 
-1. 在项目根目录执行 PR 审查脚本，根据操作系统选择合适命令：
-   - **Windows**：`py review_draft_cursor.py --pr "$ARGUMENTS" --backend agent`
-   - **macOS / Linux**：`python3 review_draft_cursor.py --pr "$ARGUMENTS" --backend agent`
-   - 若已激活虚拟环境，直接用 `python review_draft_cursor.py ...`
+1. 在项目根目录执行启动脚本：
+   - **Windows**：`review.bat "$ARGUMENTS"`
+   - **macOS / Linux**：`bash review.sh "$ARGUMENTS"`
+   - 脚本自动检测虚拟环境和可用的 Python，无需手动判断。
 
 2. 若脚本输出 `[SKIP]`，说明本次 PR diff 与上次审查完全相同，直接告知用户无需重新审查。
 
