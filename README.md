@@ -80,15 +80,42 @@ review_task_Ascend_msserviceprofiler_pr123_YYYYMMDD_HHMMSS.md
 
 ---
 
-## 可选：API 模式
+## 可选：API 模式 / 本地模型模式
 
-不依赖 AI 工具，直接调用 OpenAI 兼容接口输出审查结论（需在 `.env` 中配置 `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL`）：
+不依赖 AI 工具，直接调用模型输出审查结论，支持两种子模式：
+
+### `--backend api`（云端大模型）
+
+适合 GPT-4o、Claude 等上下文窗口足够大的云端模型，整个 PR diff 单次发送：
 
 ```bash
 python3 review_draft.py --pr 123 --owner Ascend --repo msserviceprofiler --backend api
 ```
 
-输出文件为 `review_Ascend_msserviceprofiler_pr123_YYYYMMDD_HHMMSS.md`。
+需在 `.env` 中配置：`LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL`
+
+### `--backend local`（本地小模型，支持并发）
+
+适合在 Linux 服务器上部署的 Qwen、LLaMA 等小模型（通过 vLLM / Ollama 等暴露 OpenAI 兼容接口）。  
+自动将 diff **按文件拆成小批次**，通过线程池并发发送，最后汇总结果：
+
+```bash
+python3 review_draft.py --pr 123 --owner Ascend --repo msserviceprofiler --backend local
+```
+
+需在 `.env` 中配置：
+
+```
+LLM_API_BASE=http://your-server:8000/v1   # vLLM / Ollama 地址
+LLM_API_KEY=                              # 本地模型可留空
+LLM_MODEL=qwen2.5-7b-instruct            # 与服务端模型名一致
+
+LOCAL_BATCH_CHARS=6000    # 每批 diff 字符上限（根据模型 context window 调整）
+LOCAL_MAX_WORKERS=4       # 并发请求数（不超过服务端并发上限）
+LOCAL_REQUEST_TIMEOUT=180 # 单次请求超时（秒）
+```
+
+输出文件为 `review_<owner>_<repo>_pr<N>_<timestamp>.md`。
 
 ---
 

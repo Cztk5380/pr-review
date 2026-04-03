@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -539,6 +540,34 @@ def sync_local_repo(owner: str, repo: str, target_branch: str = "master") -> Tup
     return (f"成功：仓库已同步到最新远端状态（分支：{branch}）", str(local_repo_path.resolve()))
 
 
+def _call_llm_single(
+    url: str,
+    headers: Dict[str, str],
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.2,
+    timeout: int = 120,
+) -> str:
+    “””向 OpenAI 兼容接口发送单次请求，返回文本内容。”””
+    payload = {
+        “model”: model,
+        “temperature”: temperature,
+        “messages”: [
+            {“role”: “system”, “content”: system_prompt},
+            {“role”: “user”, “content”: user_prompt},
+        ],
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    if resp.status_code >= 400:
+        raise RuntimeError(f”LLM API 失败: {resp.status_code} {resp.text[:500]}”)
+    data = resp.json()
+    try:
+        return data[“choices”][0][“message”][“content”].strip()
+    except Exception as exc:
+        raise RuntimeError(f”LLM 返回格式异常: {data}”) from exc
+
+
 def llm_generate_markdown(
     llm_base: str,
     llm_key: str,
@@ -548,63 +577,166 @@ def llm_generate_markdown(
     number: int,
     pr_data: Dict[str, Any],
     diff_text: str,
+    timeout: int = 120,
 ) -> str:
-    url = f"{llm_base.rstrip('/')}/chat/completions"
-    headers = {"Authorization": f"Bearer {llm_key}", "Content-Type": "application/json"}
+    “””单次请求模式（--backend api），适合上下文窗口足够大的云端模型。”””
+    url = f”{llm_base.rstrip('/')}/chat/completions”
+    headers = {“Authorization”: f”Bearer {llm_key}”, “Content-Type”: “application/json”}
 
-    pr_title = pr_data.get("title", "")
-    pr_body = pr_data.get("body") or pr_data.get("description") or ""
-    source_branch = pr_data.get("source_branch", "")
-    target_branch = pr_data.get("target_branch", "")
+    pr_title = pr_data.get(“title”, “”)
+    pr_body = pr_data.get(“body”) or pr_data.get(“description”) or “”
+    source_branch = pr_data.get(“source_branch”, “”)
+    target_branch = pr_data.get(“target_branch”, “”)
 
     system_prompt = (
-        "你是资深代码审查工程师。请基于给定 PR 信息与 diff，"
-        "输出中文审查草稿，要求严谨、可执行、避免臆测。只输出 Markdown。"
+        “你是资深代码审查工程师。请基于给定 PR 信息与 diff，”
+        “输出中文审查草稿，要求严谨、可执行、避免臆测。只输出 Markdown。”
     )
-    user_prompt = f"""
-仓库: {owner}/{repo}
-PR: #{number}
-标题: {pr_title}
-源分支: {source_branch}
-目标分支: {target_branch}
-描述:
-{pr_body}
+    user_prompt = f”””仓库: {owner}/{repo}  PR: #{number}
+标题: {pr_title}  源分支: {source_branch} → 目标分支: {target_branch}
+描述: {pr_body}
 
 请按以下结构输出：
 1) 概览（1-3条）
 2) 重点风险（按高/中/低）
-3) 详细审查意见（每条必须使用固定模板，见下）
-4) 建议补充测试（若无写“暂无”）
-5) 可直接发布到PR的“总评草稿”
+3) 详细审查意见（固定模板见下）
+4) 建议补充测试（若无写”暂无”）
+5) 总评草稿（可直接发布到PR）
 
-注意：
-- 如果证据不足，明确标注“需人工确认”
-- 不要编造未在diff中出现的文件或逻辑
-- 评审偏向 bug/稳定性/性能/可维护性
+详细意见模板（强制）：
+[文件:<path>] [行号:<start>-<end>] [严重级别:<高/中/低>] 【review】<标题> <问题点+影响+触发场景> 修改建议：<改法+行内代码>
 
-详细审查意见固定模板（强制）：
-[文件:<path>] [行号:<start>-<end>] [严重级别:<高/中/低>] 【review】<一句话标题> <具体问题点，定位到文件/函数/行为> <影响与触发条件；证据不足时写“需人工确认”> 修改建议：<可直接落地的改法 + 最小改动代码（必须包含代码，优先使用行内代码 `...`）>
+注意：证据不足写”需人工确认”；不编造 diff 中未出现的内容。
 
-以下是 diff 片段：
-{diff_text}
-"""
-    payload = {
-        "model": model,
-        "temperature": 0.2,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+diff 片段：
+{diff_text}”””
 
-    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"LLM API 失败: {resp.status_code} {resp.text[:500]}")
-    data = resp.json()
+    return _call_llm_single(url, headers, model, system_prompt, user_prompt, timeout=timeout)
+
+
+def _build_batch_prompts(
+    owner: str,
+    repo: str,
+    number: int,
+    pr_title: str,
+    compacted_diffs: Dict[str, str],
+    batch_chars: int,
+) -> List[Tuple[List[str], str]]:
+    “””将 compacted_diffs 按 batch_chars 分批，返回 [(filenames, diff_text), ...]。”””
+    batches: List[Tuple[List[str], str]] = []
+    current_files: List[str] = []
+    current_parts: List[str] = []
+    current_len = 0
+
+    for filename, diff in compacted_diffs.items():
+        entry = f”\n### FILE: {filename}\n```diff\n{diff}\n```\n”
+        if current_len + len(entry) > batch_chars and current_files:
+            batches.append((current_files, “”.join(current_parts)))
+            current_files, current_parts, current_len = [], [], 0
+        current_files.append(filename)
+        current_parts.append(entry)
+        current_len += len(entry)
+
+    if current_files:
+        batches.append((current_files, “”.join(current_parts)))
+    return batches
+
+
+def llm_generate_local(
+    llm_base: str,
+    llm_key: str,
+    model: str,
+    owner: str,
+    repo: str,
+    number: int,
+    pr_data: Dict[str, Any],
+    compacted_diffs: Dict[str, str],
+    batch_chars: int = 6000,
+    max_workers: int = 4,
+    request_timeout: int = 180,
+) -> str:
+    “””并发批次模式（--backend local），适合本地小模型。
+
+    将 diff 按 batch_chars 拆分成多个批次，并发发送给本地模型，
+    最后把各批次结论合并为一个完整的审查报告。
+    “””
+    url = f”{llm_base.rstrip('/')}/chat/completions”
+    headers = {“Authorization”: f”Bearer {llm_key}”, “Content-Type”: “application/json”}
+
+    pr_title = pr_data.get(“title”, “”)
+    pr_body = pr_data.get(“body”) or pr_data.get(“description”) or “”
+
+    batches = _build_batch_prompts(owner, repo, number, pr_title, compacted_diffs, batch_chars)
+    if not batches:
+        return “（无可用 diff，跳过本地模型审查）”
+
+    total = len(batches)
+    print(f”[LOCAL] 共 {total} 个批次，并发数={max_workers}，逐批发送给本地模型…”)
+
+    system_prompt = (
+        “你是资深代码审查工程师，只输出中文。”
+        “针对给出的代码变更，找出真实存在的 bug、安全、性能或稳定性问题。”
+        “证据不足时写”需人工确认”，不编造内容，不重复规范类意见。”
+    )
+
+    def review_one_batch(idx_batch: Tuple[int, Tuple[List[str], str]]) -> Tuple[int, str]:
+        idx, (filenames, diff_text) = idx_batch
+        file_list = “, “.join(filenames)
+        user_prompt = (
+            f”仓库: {owner}/{repo}  PR #{number}  标题: {pr_title}\n”
+            f”本批文件（{idx+1}/{total}）：{file_list}\n\n”
+            “对每个问题严格按以下模板输出一行：\n”
+            “[文件:<path>] [行号:<start>-<end>] [严重级别:<高/中/低>] “
+            “【review】<一句话标题> <问题点+影响+触发场景> “
+            “修改建议：<改法，代码用行内代码 `示例`>\n\n”
+            “若本批无实质性问题，只输出：本批无实质性问题。\n\n”
+            f”diff：\n{diff_text}”
+        )
+        try:
+            result = _call_llm_single(
+                url, headers, model, system_prompt, user_prompt,
+                temperature=0.1, timeout=request_timeout,
+            )
+            print(f”[LOCAL] 批次 {idx+1}/{total} 完成”)
+            return idx, result
+        except Exception as exc:
+            print(f”[LOCAL] 批次 {idx+1}/{total} 失败: {exc}”, file=sys.stderr)
+            return idx, f”[批次 {idx+1} 审查失败: {exc}]”
+
+    results: List[Tuple[int, str]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(review_one_batch, (i, b)): i for i, b in enumerate(batches)}
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
+
+    results.sort(key=lambda x: x[0])
+    batch_sections = “\n\n”.join(f”<!-- 批次 {i+1} -->\n{text}” for i, text in results)
+
+    # 如果只有一个批次，直接返回；多批次做一次汇总
+    if total == 1:
+        return results[0][1]
+
+    print(f”[LOCAL] 所有批次完成，正在汇总…”)
+    summary_user_prompt = (
+        f”仓库: {owner}/{repo}  PR #{number}  标题: {pr_title}\n\n”
+        “以下是对各批文件分别审查得到的原始意见，请你：\n”
+        “1. 去除重复意见，保留最具代表性的一条\n”
+        “2. 按严重级别排序（高→中→低）\n”
+        “3. 在末尾写一段”总评草稿”（3-5句话，可直接粘贴到PR）\n”
+        “输出格式保持原有模板，只输出 Markdown。\n\n”
+        f”原始意见：\n{batch_sections}”
+    )
     try:
-        return data["choices"][0]["message"]["content"].strip()
+        final = _call_llm_single(
+            url, headers, model, system_prompt, summary_user_prompt,
+            temperature=0.1, timeout=request_timeout,
+        )
     except Exception as exc:
-        raise RuntimeError(f"LLM 返回格式异常: {data}") from exc
+        # 汇总失败时直接拼接各批次结果
+        print(f”[LOCAL] 汇总请求失败（{exc}），直接输出各批次原始结果”, file=sys.stderr)
+        final = batch_sections
+
+    return final
 
 
 def build_cursor_task_markdown(
@@ -723,9 +855,9 @@ def main() -> int:
     parser.add_argument("--repo", default="", help="当 --pr 为纯数字时必填")
     parser.add_argument(
         "--backend",
-        choices=["agent", "api", "cursor"],  # cursor 保留为 agent 的兼容别名
+        choices=["agent", "api", "local", "cursor"],  # cursor 保留为 agent 的兼容别名
         default="agent",
-        help="agent=生成给任意 AI Agent 的任务草稿（默认）；api=调用 OpenAI 兼容接口直接生成结论；cursor=同 agent（兼容旧用法）",
+        help="agent=生成给任意 AI Agent 的任务草稿（默认）；api=单次请求云端模型；local=并发批次本地模型；cursor=同 agent（兼容旧用法）",
     )
     args = parser.parse_args()
     # 兼容旧的 --backend cursor 写法
@@ -826,20 +958,41 @@ def main() -> int:
         if not enable_line_candidates:
             line_comment_candidates_text += "\n（候选文件默认不落盘；设置 ENABLE_LINE_CANDIDATES=true 可输出 line_candidates 文件）"
 
-        if args.backend == "api":
+        if args.backend in ("api", "local"):
             llm_base = must_env("LLM_API_BASE")
-            llm_key = must_env("LLM_API_KEY")
-            model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-            markdown = llm_generate_markdown(
-                llm_base=llm_base,
-                llm_key=llm_key,
-                model=model,
-                owner=owner,
-                repo=repo,
-                number=number,
-                pr_data=pr_data,
-                diff_text=diff_excerpt,
-            )
+            llm_key = os.getenv("LLM_API_KEY", "")   # 本地模型可以不需要 key
+            model = must_env("LLM_MODEL")
+
+            if args.backend == "local":
+                batch_chars = int(os.getenv("LOCAL_BATCH_CHARS", "6000"))
+                max_workers = int(os.getenv("LOCAL_MAX_WORKERS", "4"))
+                request_timeout = int(os.getenv("LOCAL_REQUEST_TIMEOUT", "180"))
+                markdown = llm_generate_local(
+                    llm_base=llm_base,
+                    llm_key=llm_key,
+                    model=model,
+                    owner=owner,
+                    repo=repo,
+                    number=number,
+                    pr_data=pr_data,
+                    compacted_diffs=compacted_diffs,
+                    batch_chars=batch_chars,
+                    max_workers=max_workers,
+                    request_timeout=request_timeout,
+                )
+            else:
+                api_timeout = int(os.getenv("LLM_REQUEST_TIMEOUT", "120"))
+                markdown = llm_generate_markdown(
+                    llm_base=llm_base,
+                    llm_key=llm_key,
+                    model=model,
+                    owner=owner,
+                    repo=repo,
+                    number=number,
+                    pr_data=pr_data,
+                    diff_text=diff_excerpt,
+                    timeout=api_timeout,
+                )
             output_path = save_markdown(owner, repo, number, markdown, prefix="review")
             print(f"[OK] 审查草稿已生成: {output_path}")
             return 0
