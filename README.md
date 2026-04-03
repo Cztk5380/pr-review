@@ -80,6 +80,18 @@ review_task_Ascend_msserviceprofiler_pr123_YYYYMMDD_HHMMSS.md
 
 ---
 
+## 可选：API 模式
+
+不依赖 AI 工具，直接调用 OpenAI 兼容接口输出审查结论（需在 `.env` 中配置 `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL`）：
+
+```bash
+python3 review_draft_cursor.py --pr 123 --owner Ascend --repo msserviceprofiler --backend api
+```
+
+输出文件为 `review_Ascend_msserviceprofiler_pr123_YYYYMMDD_HHMMSS.md`。
+
+---
+
 ## 增量复审
 
 开启 `INCREMENTAL_REVIEW=true`（默认）后：
@@ -111,15 +123,3 @@ review_task_Ascend_msserviceprofiler_pr123_YYYYMMDD_HHMMSS.md
 - `GET /repos/{owner}/{repo}/pulls/{number}/files` — 文件变更列表（自动分页）
 
 参考文档：<https://docs.gitcode.com/v1-docs/docs/openapi/repos/pulls/>
-
----
-
-## 可选：API 模式
-
-不依赖 AI 工具，直接调用 OpenAI 兼容接口输出审查结论（需在 `.env` 中配置 `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL`）：
-
-```bash
-python3 review_draft_cursor.py --pr 123 --owner Ascend --repo msserviceprofiler --backend api
-```
-
-输出文件为 `review_Ascend_msserviceprofiler_pr123_YYYYMMDD_HHMMSS.md`。
