@@ -115,6 +115,10 @@ def _safe_truncate(s: str, max_chars: int) -> str:
     if cut < max_chars // 2:
         cut = max_chars
     return s[:cut]
+
+
+def _split_hunks(diff_text: str) -> List[str]:
+    """将 unified diff 文本按 @@ 分割为独立 hunk 列表。"""
     lines = diff_text.splitlines()
     hunks: List[List[str]] = []
     current: List[str] = []
