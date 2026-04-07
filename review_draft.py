@@ -473,6 +473,8 @@ def filter_incremental_files(
 
 def run_git_command(args: List[str], cwd: Optional[Path] = None, timeout: int = 120) -> Tuple[int, str]:
     try:
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"  # 禁止 git 弹出交互式密码框
         proc = subprocess.run(
             ["git"] + args,
             cwd=str(cwd) if cwd else None,
@@ -482,6 +484,7 @@ def run_git_command(args: List[str], cwd: Optional[Path] = None, timeout: int = 
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            env=env,
         )
         return proc.returncode, proc.stdout.strip()
     except subprocess.TimeoutExpired:
@@ -497,8 +500,14 @@ def sync_local_repo(owner: str, repo: str, target_branch: str = "master") -> Tup
     remote_base = os.getenv("REPO_REMOTE_URL", "").strip()
     if not remote_base:
         remote_base = f"https://gitcode.com/{owner}/{repo}.git"
-    # 将 token 注入 URL，避免存入 .git/config（用 -c http.extraHeader 而非 URL 嵌入）
-    git_auth_args = ["-c", f"http.extraHeader=Authorization: Bearer {token}"] if token else []
+
+    # 将 token 嵌入 URL 仅用于 clone/fetch（不写入 .git/config，避免泄露）
+    # 同时禁用 credential.helper，防止系统 credential helper 拦截并弹出密码框
+    if token and remote_base.startswith("https://"):
+        authed_remote = remote_base.replace("https://", f"https://oauth2:{token}@", 1)
+    else:
+        authed_remote = remote_base
+    no_credential_args = ["-c", "credential.helper="]
 
     if local_repo_path.exists() and not (local_repo_path / ".git").exists():
         return (
@@ -508,11 +517,11 @@ def sync_local_repo(owner: str, repo: str, target_branch: str = "master") -> Tup
 
     local_repo_path.parent.mkdir(parents=True, exist_ok=True)
     if not local_repo_path.exists():
-        code, output = run_git_command(git_auth_args + ["clone", remote_base, str(local_repo_path)], timeout=300)
+        code, output = run_git_command(no_credential_args + ["clone", authed_remote, str(local_repo_path)], timeout=300)
         if code != 0:
             return (f"失败：clone 异常 -> {output}", str(local_repo_path.resolve()))
 
-    code, output = run_git_command(git_auth_args + ["fetch", "--all", "--prune"], cwd=local_repo_path, timeout=180)
+    code, output = run_git_command(no_credential_args + ["fetch", authed_remote, "--prune"], cwd=local_repo_path, timeout=180)
     if code != 0:
         return (f"失败：fetch 异常 -> {output}", str(local_repo_path.resolve()))
 
