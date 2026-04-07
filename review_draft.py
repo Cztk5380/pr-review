@@ -41,7 +41,7 @@ def parse_pr_input(pr_input: str) -> Tuple[str, str, int]:
 
 def gitcode_get(api_base: str, token: str, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = f"{api_base.rstrip('/')}/{path.lstrip('/')}"
-    headers = {"Authorization": f"token {token}"}
+    headers = {"Authorization": f"Bearer {token}"}
     resp = requests.get(url, headers=headers, params=params or {}, timeout=60)
     if resp.status_code >= 400:
         raise RuntimeError(f"GitCode API 失败: {resp.status_code} {resp.text[:500]}")
@@ -498,7 +498,7 @@ def sync_local_repo(owner: str, repo: str, target_branch: str = "master") -> Tup
     if not remote_base:
         remote_base = f"https://gitcode.com/{owner}/{repo}.git"
     # 将 token 注入 URL，避免存入 .git/config（用 -c http.extraHeader 而非 URL 嵌入）
-    git_auth_args = ["-c", f"http.extraHeader=Authorization: token {token}"] if token else []
+    git_auth_args = ["-c", f"http.extraHeader=Authorization: Bearer {token}"] if token else []
 
     if local_repo_path.exists() and not (local_repo_path / ".git").exists():
         return (
