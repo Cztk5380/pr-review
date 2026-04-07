@@ -9,23 +9,26 @@ A single-file Python CLI tool that fetches GitCode PR diffs, syncs the local rep
 ## Setup
 
 ```bash
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 cp .env.example .env  # then fill in credentials
 ```
+
+Python 环境由用户自行管理（系统 Python 或虚拟环境均可）。
 
 ## Running
 
 ```bash
 # By PR URL (agent backend, default)
-python .\review_draft_cursor.py --pr "https://gitcode.com/Owner/repo/pulls/123"
+python review_draft.py --pr "https://gitcode.com/Owner/repo/pulls/123"
 
 # By PR number
-python .\review_draft_cursor.py --pr 123 --owner Owner --repo myrepo
+python review_draft.py --pr 123 --owner Owner --repo myrepo
 
 # Direct LLM mode (requires LLM_API_BASE / LLM_API_KEY / LLM_MODEL in .env)
-python .\review_draft_cursor.py --pr 123 --owner Owner --repo myrepo --backend api
+python review_draft.py --pr 123 --owner Owner --repo myrepo --backend api
+
+# Local small model mode (concurrent batches)
+python review_draft.py --pr 123 --owner Owner --repo myrepo --backend local
 ```
 
 Output lands in `output/`:
@@ -56,7 +59,7 @@ Output lands in `output/`:
 
 ## Architecture
 
-All logic is in `review_draft_cursor.py`. The pipeline is:
+All logic is in `review_draft.py`. The pipeline is:
 
 ```
 parse_pr_input()          # URL or number → (owner, repo, number)
@@ -66,8 +69,9 @@ build_diff_fingerprint()  # SHA256 per file for incremental tracking
 filter_incremental_files()# compare to .review_cache/, skip unchanged
 build_diff_excerpt()      # two-stage diff compaction (see below)
 build_line_comment_candidates()  # precise new-file line number mapping
-  → cursor backend: build_cursor_task_markdown() → cursor_task_*.md
-  → api backend:    llm_generate_markdown() → OpenAI-compatible call → review_*.md
+  → agent backend: build_cursor_task_markdown() → review_task_*.md
+  → api backend:   llm_generate_markdown() → OpenAI-compatible call → review_*.md
+  → local backend: llm_generate_local() → concurrent batches → review_*.md
 save_review_state()       # persist fingerprints to .review_cache/
 ```
 
@@ -84,7 +88,7 @@ For large PRs, `build_diff_excerpt()` uses a risk-based two-pass strategy to sta
 
 ## Cursor Skill Integration
 
-`.cursor/skills/pr-review-auto/SKILL.md` defines the `pr-review-auto` skill. Trigger phrase: `review <pr-link>`. The skill detects the OS to pick the right Python command, runs the script, reads the generated `cursor_task_*.md`, and outputs formatted review comments in Chinese with the template:
+`.cursor/skills/pr-review-auto/SKILL.md` defines the `pr-review-auto` skill. Trigger phrase: `review <pr-link>`. The skill runs `python review_draft.py`, reads the generated `review_task_*.md`, and outputs formatted review comments in Chinese with the template:
 
 ```
 [文件:<path>] [行号:<start>-<end>] [严重级别:<高/中/低>] 【review】<title> <problem description> 修改建议：<suggestion with inline code>
@@ -100,7 +104,7 @@ Comments are sorted by severity (高/中/低), with a "总评草稿" (general as
 /review https://gitcode.com/Owner/repo/pulls/123
 ```
 
-It executes the same script and outputs the full structured review inline.
+It runs `python review_draft.py` and outputs the full structured review inline.
 
 ## GitCode APIs Used
 

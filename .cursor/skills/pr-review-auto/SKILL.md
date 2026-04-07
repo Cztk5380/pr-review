@@ -15,10 +15,8 @@ description: 自动化生成并输出可直接粘贴的 PR 检视意见。用于
 ## 执行流程
 
 1. 接收用户提供的 PR 链接。
-2. 在项目根目录执行启动脚本：
-   - **Windows**：`review.bat "<PR链接>" --backend agent`
-   - **macOS / Linux**：`bash review.sh "<PR链接>" --backend agent`
-   - 脚本会自动检测虚拟环境和可用的 Python 命令，无需手动判断。
+2. 在项目根目录执行（需自行确保 Python 环境已激活）：
+   - `python review_draft.py "<PR链接>" --backend agent`
 3. 从 `output/` 目录读取最新生成的 `review_task_*.md` 与（若存在）`line_candidates_*.md`。
 4. 基于任务文件与 diff，直接输出最终检视意见（无需用户再复制中间文件），要求：
    - 按严重级别排序（高/中/低）

@@ -8,10 +8,8 @@
 
 ## 执行步骤
 
-1. 在项目根目录执行启动脚本：
-   - **Windows**：`review.bat "$ARGUMENTS"`
-   - **macOS / Linux**：`bash review.sh "$ARGUMENTS"`
-   - 脚本自动检测虚拟环境和可用的 Python，无需手动判断。
+1. 在项目根目录执行（需自行确保 Python 环境已激活）：
+   - `python review_draft.py $ARGUMENTS`
 
 2. 若脚本输出 `[SKIP]`，说明本次 PR diff 与上次审查完全相同，直接告知用户无需重新审查。
 
