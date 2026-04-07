@@ -687,23 +687,27 @@ def llm_generate_local(
     print(f"[LOCAL] 共 {total} 个批次，并发数={max_workers}，逐批发送给本地模型…")
 
     _FEW_SHOT_EXAMPLE = (
-        "输出示例（严格照此格式，每条一行）：\n"
+        "输出示例（严格照此格式，每条一行，高/中/低三种级别都可以用）：\n"
         "[文件:src/server.py] [行号:42-45] [严重级别:高] 【review】异常未捕获导致进程崩溃 "
         "`connect()` 在网络不可达时抛出 `OSError`，调用方无 try/except，服务会直接退出。"
         " 修改建议：在调用处包裹 `try: ... except OSError as e: logger.error(e); return None`\n"
         "[文件:utils/config.py] [行号:88-88] [严重级别:中] 【review】硬编码超时值缺乏灵活性 "
         "`timeout=30` 写死，高负载环境下频繁超时。"
         " 修改建议：改为从配置读取 `timeout = cfg.get('timeout', 30)`\n"
+        "[文件:utils/helper.py] [行号:12-12] [严重级别:低] 【review】缺少边界检查需人工确认 "
+        "`index` 未校验是否越界，在极端输入下可能引发 IndexError。"
+        " 修改建议：添加 `if index >= len(items): return None` 防御\n"
     )
 
     system_prompt = (
         "你是资深代码审查工程师，只输出中文。\n"
-        "你的唯一任务：在 diff 中找出真实存在的 BUG、安全漏洞、性能隐患或稳定性问题，"
-        "并给出具体修改建议。\n"
-        "【严格禁止】描述 PR 做了什么改动、优化了什么功能——那不是审查意见。\n"
+        "任务：审查 diff，输出所有值得关注的问题，包括 BUG、安全、性能、稳定性、"
+        "可维护性、边界条件、错误处理缺失等，严重级别可以是高/中/低。\n"
+        "拿不准的问题标注「需人工确认」后仍然输出，不要因为不确定就跳过。\n"
+        "【严格禁止】描述 PR 做了什么改动——那不是审查意见。\n"
         "【严格禁止】输出总结段落、解释性文字、标题行。\n"
-        "每条意见必须是独立的一行，格式完全照示例。\n"
-        "若确实无问题，只输出：无实质性问题。"
+        "每条意见必须是独立的一行，格式完全照示例，必须含「修改建议：」字段。\n"
+        "每批 diff 必须至少输出 1 条意见，哪怕是低严重级别。"
     )
 
     def review_one_batch(idx_batch: Tuple[int, Tuple[List[str], str]]) -> Tuple[int, str]:
@@ -714,7 +718,7 @@ def llm_generate_local(
             f"本批文件（{idx+1}/{total}）：{file_list}\n\n"
             + _FEW_SHOT_EXAMPLE +
             "现在对下方 diff 按示例格式逐条输出审查意见，"
-            "每条必须包含「修改建议：」字段，不得省略：\n\n"
+            "至少输出 1 条（低严重级别也算），每条必须含「修改建议：」字段：\n\n"
             f"diff：\n{diff_text}"
         )
         try:
